@@ -79,7 +79,8 @@ class LeasingParser:
         try:
             response = self.session.get(url, timeout=10)
             response.raise_for_status()
-            return BeautifulSoup(response.content, 'lxml')
+            # Используем html.parser вместо lxml (не требует компиляции)
+            return BeautifulSoup(response.content, 'html.parser')
         except Exception as e:
             logger.error(f"Ошибка при получении страницы {url}: {e}")
             return None
@@ -95,51 +96,79 @@ class RDEParser(LeasingParser):
         """Парсит rde.ee на наличие лизинга с 0%"""
         results = []
         
-        # Основные категории электроники
-        categories = [
-            "/arvutid",
-            "/mobiiltelefonid",
-            "/televiisorid",
-            "/koduelektroonika"
-        ]
+        # Парсим главную страницу
+        url = f"{self.base_url}/"
+        soup = self.get_page(url)
         
-        for category in categories:
-            url = f"{self.base_url}{category}"
-            soup = self.get_page(url)
+        if not soup:
+            logger.warning(f"Не удалось загрузить главную страницу {self.base_url}")
+            return results
+        
+        # Ищем все ссылки на странице, которые могут вести к товарам
+        all_links = soup.find_all('a', href=True)
+        product_links = []
+        
+        for link in all_links:
+            href = link.get('href', '')
+            link_text = link.get_text(strip=True).lower()
             
-            if not soup:
-                continue
+            # Ищем ссылки, которые могут быть товарами
+            if any(keyword in link_text for keyword in ['leasing', 'liising', '0%', '0 protsenti']):
+                if href.startswith('/') or self.base_url in href:
+                    if not href.startswith('http'):
+                        href = self.base_url + href
+                    product_links.append((href, link_text))
+        
+        # Также ищем упоминания лизинга в тексте страницы
+        page_text = soup.get_text()
+        if self.search_leasing_keywords(page_text):
+            # Ищем ближайшие ссылки к тексту о лизинге
+            leasing_elements = soup.find_all(string=re.compile(r'leasing|liising|0\s*%', re.I))
             
-            # Ищем товары на странице
-            products = soup.find_all(['div', 'article'], class_=re.compile(r'product|item|card', re.I))
-            
-            for product in products:
-                product_text = product.get_text()
-                
-                if self.search_leasing_keywords(product_text):
-                    title_elem = product.find(['h2', 'h3', 'a'], class_=re.compile(r'title|name', re.I))
-                    title = title_elem.get_text(strip=True) if title_elem else "Без названия"
-                    
-                    link_elem = product.find('a', href=True)
-                    link = link_elem['href'] if link_elem else url
-                    if not link.startswith('http'):
-                        link = self.base_url + link
-                    
-                    price_elem = product.find(['span', 'div'], class_=re.compile(r'price', re.I))
-                    price = price_elem.get_text(strip=True) if price_elem else "Цена не указана"
-                    
-                    # Извлекаем срок лизинга
-                    leasing_period = self.extract_leasing_period(product_text)
-                    
-                    results.append({
-                        'site': self.site_name,
-                        'title': title,
-                        'price': price,
-                        'url': link,
-                        'category': category,
-                        'leasing_period': leasing_period,
-                        'found_at': datetime.now().isoformat()
-                    })
+            for elem in leasing_elements:
+                # Ищем родительский элемент с ссылкой
+                parent = elem.find_parent(['div', 'article', 'section', 'li'])
+                if parent:
+                    link_elem = parent.find('a', href=True)
+                    if link_elem:
+                        href = link_elem.get('href', '').strip()
+                        
+                        # Пропускаем невалидные ссылки
+                        if not href or href == '#' or href.startswith('javascript:') or href.startswith('mailto:'):
+                            continue
+                        
+                        # Нормализуем URL
+                        if href.startswith('/'):
+                            href = self.base_url + href
+                        elif not href.startswith('http'):
+                            href = self.base_url + '/' + href.lstrip('/')
+                        
+                        # Извлекаем информацию о товаре
+                        title_elem = parent.find(['h1', 'h2', 'h3', 'h4', 'a'])
+                        title = title_elem.get_text(strip=True) if title_elem else "Товар с лизингом 0%"
+                        
+                        # Если название слишком короткое, берем текст ссылки
+                        if len(title) < 10:
+                            title = link_elem.get_text(strip=True) or title
+                        
+                        price_elem = parent.find(['span', 'div'], class_=re.compile(r'price|hind', re.I))
+                        price = price_elem.get_text(strip=True) if price_elem else "Цена не указана"
+                        
+                        # Извлекаем срок лизинга
+                        parent_text = parent.get_text()
+                        leasing_period = self.extract_leasing_period(parent_text)
+                        
+                        # Проверяем, что это новый товар
+                        if not any(r['url'] == href for r in results):
+                            results.append({
+                                'site': self.site_name,
+                                'title': title[:500],  # Ограничиваем длину
+                                'price': price,
+                                'url': href,
+                                'category': '/',
+                                'leasing_period': leasing_period,
+                                'found_at': datetime.now().isoformat()
+                            })
         
         logger.info(f"RDE: найдено {len(results)} товаров с лизингом 0%")
         return results
@@ -155,50 +184,59 @@ class KlickParser(LeasingParser):
         """Парсит klick.ee на наличие лизинга с 0%"""
         results = []
         
-        categories = [
-            "/arvutid",
-            "/telefonid",
-            "/tv",
-            "/koduelektroonika"
-        ]
+        # Парсим главную страницу
+        url = f"{self.base_url}/"
+        soup = self.get_page(url)
         
-        for category in categories:
-            url = f"{self.base_url}{category}"
-            soup = self.get_page(url)
+        if not soup:
+            logger.warning(f"Не удалось загрузить главную страницу {self.base_url}")
+            return results
+        
+        # Ищем упоминания лизинга в тексте страницы
+        page_text = soup.get_text()
+        if self.search_leasing_keywords(page_text):
+            # Ищем элементы с упоминанием лизинга
+            leasing_elements = soup.find_all(string=re.compile(r'leasing|liising|0\s*%', re.I))
             
-            if not soup:
-                continue
-            
-            # Ищем товары
-            products = soup.find_all(['div', 'li'], class_=re.compile(r'product|item', re.I))
-            
-            for product in products:
-                product_text = product.get_text()
-                
-                if self.search_leasing_keywords(product_text):
-                    title_elem = product.find(['h2', 'h3', 'h4', 'a'], class_=re.compile(r'title|name|product', re.I))
-                    title = title_elem.get_text(strip=True) if title_elem else "Без названия"
-                    
-                    link_elem = product.find('a', href=True)
-                    link = link_elem['href'] if link_elem else url
-                    if not link.startswith('http'):
-                        link = self.base_url + link
-                    
-                    price_elem = product.find(['span', 'div'], class_=re.compile(r'price', re.I))
-                    price = price_elem.get_text(strip=True) if price_elem else "Цена не указана"
-                    
-                    # Извлекаем срок лизинга
-                    leasing_period = self.extract_leasing_period(product_text)
-                    
-                    results.append({
-                        'site': self.site_name,
-                        'title': title,
-                        'price': price,
-                        'url': link,
-                        'category': category,
-                        'leasing_period': leasing_period,
-                        'found_at': datetime.now().isoformat()
-                    })
+            for elem in leasing_elements:
+                parent = elem.find_parent(['div', 'article', 'section', 'li', 'a'])
+                if parent:
+                    link_elem = parent.find('a', href=True) if parent.name != 'a' else parent
+                    if link_elem and link_elem.get('href'):
+                        href = link_elem.get('href', '').strip()
+                        
+                        # Пропускаем невалидные ссылки
+                        if not href or href == '#' or href.startswith('javascript:') or href.startswith('mailto:'):
+                            continue
+                        
+                        # Нормализуем URL
+                        if href.startswith('/'):
+                            href = self.base_url + href
+                        elif not href.startswith('http'):
+                            href = self.base_url + '/' + href.lstrip('/')
+                        
+                        title_elem = parent.find(['h1', 'h2', 'h3', 'h4']) or link_elem
+                        title = title_elem.get_text(strip=True) if title_elem else "Товар с лизингом 0%"
+                        
+                        if len(title) < 10:
+                            title = link_elem.get_text(strip=True) or title
+                        
+                        price_elem = parent.find(['span', 'div'], class_=re.compile(r'price|hind', re.I))
+                        price = price_elem.get_text(strip=True) if price_elem else "Цена не указана"
+                        
+                        parent_text = parent.get_text()
+                        leasing_period = self.extract_leasing_period(parent_text)
+                        
+                        if not any(r['url'] == href for r in results):
+                            results.append({
+                                'site': self.site_name,
+                                'title': title[:500],
+                                'price': price,
+                                'url': href,
+                                'category': '/',
+                                'leasing_period': leasing_period,
+                                'found_at': datetime.now().isoformat()
+                            })
         
         logger.info(f"Klick: найдено {len(results)} товаров с лизингом 0%")
         return results
@@ -214,50 +252,59 @@ class ArvutitarkParser(LeasingParser):
         """Парсит arvutitark.ee на наличие лизинга с 0%"""
         results = []
         
-        categories = [
-            "/arvutid",
-            "/telefonid",
-            "/tv",
-            "/koduelektroonika"
-        ]
+        # Парсим главную страницу
+        url = f"{self.base_url}/"
+        soup = self.get_page(url)
         
-        for category in categories:
-            url = f"{self.base_url}{category}"
-            soup = self.get_page(url)
+        if not soup:
+            logger.warning(f"Не удалось загрузить главную страницу {self.base_url}")
+            return results
+        
+        # Ищем упоминания лизинга в тексте страницы
+        page_text = soup.get_text()
+        if self.search_leasing_keywords(page_text):
+            # Ищем элементы с упоминанием лизинга
+            leasing_elements = soup.find_all(string=re.compile(r'leasing|liising|0\s*%', re.I))
             
-            if not soup:
-                continue
-            
-            # Ищем товары
-            products = soup.find_all(['div', 'article'], class_=re.compile(r'product|item|card', re.I))
-            
-            for product in products:
-                product_text = product.get_text()
-                
-                if self.search_leasing_keywords(product_text):
-                    title_elem = product.find(['h2', 'h3', 'a'], class_=re.compile(r'title|name', re.I))
-                    title = title_elem.get_text(strip=True) if title_elem else "Без названия"
-                    
-                    link_elem = product.find('a', href=True)
-                    link = link_elem['href'] if link_elem else url
-                    if not link.startswith('http'):
-                        link = self.base_url + link
-                    
-                    price_elem = product.find(['span', 'div'], class_=re.compile(r'price', re.I))
-                    price = price_elem.get_text(strip=True) if price_elem else "Цена не указана"
-                    
-                    # Извлекаем срок лизинга
-                    leasing_period = self.extract_leasing_period(product_text)
-                    
-                    results.append({
-                        'site': self.site_name,
-                        'title': title,
-                        'price': price,
-                        'url': link,
-                        'category': category,
-                        'leasing_period': leasing_period,
-                        'found_at': datetime.now().isoformat()
-                    })
+            for elem in leasing_elements:
+                parent = elem.find_parent(['div', 'article', 'section', 'li', 'a'])
+                if parent:
+                    link_elem = parent.find('a', href=True) if parent.name != 'a' else parent
+                    if link_elem and link_elem.get('href'):
+                        href = link_elem.get('href', '').strip()
+                        
+                        # Пропускаем невалидные ссылки
+                        if not href or href == '#' or href.startswith('javascript:') or href.startswith('mailto:'):
+                            continue
+                        
+                        # Нормализуем URL
+                        if href.startswith('/'):
+                            href = self.base_url + href
+                        elif not href.startswith('http'):
+                            href = self.base_url + '/' + href.lstrip('/')
+                        
+                        title_elem = parent.find(['h1', 'h2', 'h3', 'h4']) or link_elem
+                        title = title_elem.get_text(strip=True) if title_elem else "Товар с лизингом 0%"
+                        
+                        if len(title) < 10:
+                            title = link_elem.get_text(strip=True) or title
+                        
+                        price_elem = parent.find(['span', 'div'], class_=re.compile(r'price|hind', re.I))
+                        price = price_elem.get_text(strip=True) if price_elem else "Цена не указана"
+                        
+                        parent_text = parent.get_text()
+                        leasing_period = self.extract_leasing_period(parent_text)
+                        
+                        if not any(r['url'] == href for r in results):
+                            results.append({
+                                'site': self.site_name,
+                                'title': title[:500],
+                                'price': price,
+                                'url': href,
+                                'category': '/',
+                                'leasing_period': leasing_period,
+                                'found_at': datetime.now().isoformat()
+                            })
         
         logger.info(f"Arvutitark: найдено {len(results)} товаров с лизингом 0%")
         return results

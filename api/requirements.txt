@@ -1,7 +1,6 @@
 requests==2.31.0
 beautifulsoup4==4.12.2
-lxml==4.9.3
 flask==3.0.0
 sqlalchemy==2.0.23
 python-dateutil==2.8.2
-
+# lxml опционален - используется html.parser по умолчанию
