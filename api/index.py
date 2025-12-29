@@ -1,0 +1,168 @@
+"""
+Vercel serverless function для парсера лизинга
+"""
+import sys
+import os
+
+# Добавляем корневую директорию в путь для импорта модулей
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from flask import Flask, render_template, jsonify, request
+from database import Database
+from parser import run_all_parsers
+import logging
+
+# Настройка пути к шаблонам
+template_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'templates')
+app = Flask(__name__, template_folder=template_dir)
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Инициализация БД с путем для Vercel
+def get_db():
+    """Получает экземпляр базы данных"""
+    # На Vercel используем /tmp для записи файлов БД
+    db_path = os.path.join('/tmp', 'leasing_products.db')
+    return Database(db_path=db_path)
+
+@app.route('/', methods=['GET'])
+def index():
+    """Главная страница с результатами парсинга"""
+    try:
+        db = get_db()
+        products = db.get_all_products(limit=200)
+        products_48_months = db.get_products_48_months()
+        
+        # Группируем по сайтам
+        products_by_site = {}
+        for product in products:
+            site = product['site']
+            if site not in products_by_site:
+                products_by_site[site] = []
+            products_by_site[site].append(product)
+        
+        # Группируем товары с 48 месяцами по сайтам
+        products_48_by_site = {}
+        for product in products_48_months:
+            site = product['site']
+            if site not in products_48_by_site:
+                products_48_by_site[site] = []
+            products_48_by_site[site].append(product)
+        
+        db.close()
+        return render_template('index.html', 
+                             products_by_site=products_by_site,
+                             products_48_by_site=products_48_by_site,
+                             total_count=len(products),
+                             count_48_months=len(products_48_months))
+    except Exception as e:
+        logger.error(f"Ошибка в index: {e}", exc_info=True)
+        import traceback
+        error_details = traceback.format_exc()
+        logger.error(f"Traceback: {error_details}")
+        return jsonify({'error': str(e), 'details': error_details}), 500
+
+@app.route('/api/products', methods=['GET'])
+def api_products():
+    """API endpoint для получения всех товаров"""
+    try:
+        db = get_db()
+        products = db.get_all_products(limit=200)
+        db.close()
+        return jsonify(products)
+    except Exception as e:
+        logger.error(f"Ошибка в api_products: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/products/<site>', methods=['GET'])
+def api_products_by_site(site):
+    """API endpoint для получения товаров по сайту"""
+    try:
+        db = get_db()
+        products = db.get_products_by_site(site)
+        db.close()
+        return jsonify(products)
+    except Exception as e:
+        logger.error(f"Ошибка в api_products_by_site: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/recent', methods=['GET'])
+def api_recent():
+    """API endpoint для получения недавно найденных товаров"""
+    try:
+        db = get_db()
+        products = db.get_recent_products(hours=24)
+        db.close()
+        return jsonify(products)
+    except Exception as e:
+        logger.error(f"Ошибка в api_recent: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/products/48months', methods=['GET'])
+def api_products_48_months():
+    """API endpoint для получения товаров с лизингом на 48 месяцев"""
+    try:
+        db = get_db()
+        products = db.get_products_48_months()
+        db.close()
+        return jsonify(products)
+    except Exception as e:
+        logger.error(f"Ошибка в api_products_48_months: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/refresh', methods=['POST'])
+def api_refresh():
+    """API endpoint для ручного запуска парсинга"""
+    try:
+        db = get_db()
+        results = run_all_parsers()
+        added = db.add_products(results)
+        db.close()
+        return jsonify({
+            'success': True,
+            'found': len(results),
+            'added': added,
+            'message': f'Найдено {len(results)} товаров, добавлено {added} новых'
+        })
+    except Exception as e:
+        logger.error(f"Ошибка при парсинге: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/cron', methods=['GET', 'POST'])
+def api_cron():
+    """Cron job для автоматического парсинга (2 раза в сутки)"""
+    try:
+        # Проверяем секретный ключ для безопасности
+        auth_header = request.headers.get('Authorization', '')
+        cron_secret = os.environ.get('CRON_SECRET', '')
+        
+        if cron_secret and auth_header != f'Bearer {cron_secret}':
+            return jsonify({'error': 'Unauthorized'}), 401
+        
+        db = get_db()
+        results = run_all_parsers()
+        added = db.add_products(results)
+        db.close()
+        
+        logger.info(f"Cron job выполнен. Найдено: {len(results)}, Добавлено: {added}")
+        return jsonify({
+            'success': True,
+            'found': len(results),
+            'added': added,
+            'message': f'Найдено {len(results)} товаров, добавлено {added} новых'
+        })
+    except Exception as e:
+        logger.error(f"Ошибка в cron job: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+# Vercel serverless handler
+# Vercel автоматически использует app как WSGI приложение
+
