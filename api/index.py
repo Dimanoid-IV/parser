@@ -4,28 +4,57 @@ Vercel serverless function для парсера лизинга
 import sys
 import os
 
+# Определяем корневую директорию проекта
+# На Vercel это будет /var/task, локально - родительская директория api/
+if os.path.exists('/var/task'):
+    # Vercel production
+    root_dir = '/var/task'
+    template_dir = os.path.join(root_dir, 'templates')
+else:
+    # Локальная разработка
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    template_dir = os.path.join(root_dir, 'templates')
+
 # Добавляем корневую директорию в путь для импорта модулей
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if root_dir not in sys.path:
+    sys.path.insert(0, root_dir)
 
-from flask import Flask, render_template, jsonify, request
-from database import Database
-from parser import run_all_parsers
+# Настройка логирования перед импортами
 import logging
-
-# Настройка пути к шаблонам
-template_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'templates')
-app = Flask(__name__, template_folder=template_dir)
-
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+try:
+    from flask import Flask, render_template, jsonify, request
+    from database import Database
+    from parser import run_all_parsers
+except ImportError as e:
+    logger.error(f"Ошибка импорта модулей: {e}")
+    logger.error(f"sys.path: {sys.path}")
+    logger.error(f"root_dir: {root_dir}")
+    logger.error(f"Текущая директория: {os.getcwd()}")
+    raise
+
+# Настройка Flask приложения
+try:
+    app = Flask(__name__, template_folder=template_dir)
+    logger.info(f"Flask app создан. Template dir: {template_dir}")
+    logger.info(f"Template dir существует: {os.path.exists(template_dir)}")
+except Exception as e:
+    logger.error(f"Ошибка при создании Flask app: {e}", exc_info=True)
+    raise
 
 # Инициализация БД с путем для Vercel
 def get_db():
     """Получает экземпляр базы данных"""
     # На Vercel используем /tmp для записи файлов БД
+    # /tmp доступен для записи в serverless функциях
     db_path = os.path.join('/tmp', 'leasing_products.db')
-    return Database(db_path=db_path)
+    try:
+        return Database(db_path=db_path)
+    except Exception as e:
+        logger.error(f"Ошибка при создании БД: {e}", exc_info=True)
+        raise
 
 @app.route('/', methods=['GET'])
 def index():
@@ -133,6 +162,24 @@ def api_refresh():
             'error': str(e)
         }), 500
 
+@app.route('/api/health', methods=['GET'])
+def api_health():
+    """Health check endpoint для диагностики"""
+    try:
+        return jsonify({
+            'status': 'ok',
+            'root_dir': root_dir,
+            'template_dir': template_dir,
+            'template_exists': os.path.exists(template_dir),
+            'sys_path': sys.path[:3],  # Первые 3 элемента
+            'cwd': os.getcwd()
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
 @app.route('/api/cron', methods=['GET', 'POST'])
 def api_cron():
     """Cron job для автоматического парсинга (2 раза в сутки)"""
@@ -164,5 +211,6 @@ def api_cron():
         }), 500
 
 # Vercel serverless handler
-# Vercel автоматически использует app как WSGI приложение
+# Экспортируем app для Vercel
+# Vercel автоматически использует переменную 'app' как WSGI приложение
 

@@ -17,9 +17,6 @@
       "path": "/api/cron",
       "schedule": "0 9,21 * * *"
     }
-  ],
-  "env": {
-    "PYTHONPATH": "/var/task"
-  }
+  ]
 }
 
