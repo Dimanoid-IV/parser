@@ -14,31 +14,68 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Определяем корневую директорию проекта
-# На Vercel это будет /var/task, локально - родительская директория api/
+# На Vercel файлы находятся в /var/task, но структура может отличаться
 try:
-    if os.path.exists('/var/task'):
-        # Vercel production
-        root_dir = '/var/task'
-    else:
-        # Локальная разработка или другая среда
-        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Текущая директория файла (api/)
+    current_file_dir = os.path.dirname(os.path.abspath(__file__))
+    # Родительская директория (корень проекта)
+    project_root = os.path.dirname(current_file_dir)
     
-    template_dir = os.path.join(root_dir, 'templates')
+    # Проверяем разные возможные пути
+    possible_roots = [
+        '/var/task',  # Vercel production
+        project_root,  # Локальная разработка
+        os.getcwd(),  # Текущая рабочая директория
+    ]
     
-    # Добавляем корневую директорию в путь для импорта модулей
-    if root_dir not in sys.path:
-        sys.path.insert(0, root_dir)
+    root_dir = None
+    for possible_root in possible_roots:
+        # Проверяем наличие ключевых файлов
+        if os.path.exists(possible_root) and (
+            os.path.exists(os.path.join(possible_root, 'parser.py')) or
+            os.path.exists(os.path.join(possible_root, 'database.py'))
+        ):
+            root_dir = possible_root
+            break
+    
+    # Если не нашли, используем родительскую директорию
+    if not root_dir:
+        root_dir = project_root
+    
+    # Добавляем все возможные пути в sys.path
+    for path in possible_roots + [root_dir]:
+        if path and os.path.exists(path) and path not in sys.path:
+            sys.path.insert(0, path)
+    
+    # Ищем шаблоны в разных местах
+    template_dirs = [
+        os.path.join(root_dir, 'templates'),
+        os.path.join(project_root, 'templates'),
+        os.path.join('/var/task', 'templates'),
+        'templates',
+    ]
+    
+    template_dir = None
+    for td in template_dirs:
+        if os.path.exists(td):
+            template_dir = td
+            break
+    
+    if not template_dir:
+        template_dir = os.path.join(root_dir, 'templates')
     
     logger.info(f"Root dir: {root_dir}")
     logger.info(f"Template dir: {template_dir}")
     logger.info(f"Template exists: {os.path.exists(template_dir)}")
     logger.info(f"Current dir: {os.getcwd()}")
-    logger.info(f"Python path: {sys.path[:3]}")
+    logger.info(f"Files in root: {os.listdir(root_dir)[:10] if os.path.exists(root_dir) else 'N/A'}")
     
 except Exception as e:
     logger.error(f"Ошибка при настройке путей: {e}")
     logger.error(traceback.format_exc())
-    raise
+    # Продолжаем с дефолтными значениями
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    template_dir = os.path.join(root_dir, 'templates')
 
 # Импорт модулей с обработкой ошибок
 try:
@@ -49,14 +86,23 @@ except ImportError as e:
     logger.error(traceback.format_exc())
     raise
 
+# Импортируем модули проекта
+Database = None
+run_all_parsers = None
+
 try:
     from database import Database
     logger.info("Database импортирован успешно")
 except ImportError as e:
     logger.error(f"Ошибка импорта Database: {e}")
     logger.error(f"sys.path: {sys.path}")
+    logger.error(f"Проверяемые пути: {[p for p in sys.path[:5] if os.path.exists(p)]}")
     logger.error(traceback.format_exc())
-    raise
+    # Создаем заглушку для диагностики
+    class DatabaseStub:
+        def __init__(self, *args, **kwargs):
+            raise ImportError(f"Database module not found. sys.path: {sys.path[:5]}")
+    Database = DatabaseStub
 
 try:
     from parser import run_all_parsers
@@ -65,32 +111,70 @@ except ImportError as e:
     logger.error(f"Ошибка импорта Parser: {e}")
     logger.error(f"sys.path: {sys.path}")
     logger.error(traceback.format_exc())
-    raise
+    def run_all_parsers_stub():
+        raise ImportError(f"Parser module not found. sys.path: {sys.path[:5]}")
+    run_all_parsers = run_all_parsers_stub
 
 # Настройка Flask приложения
 try:
+    # Если шаблоны не найдены, используем относительный путь
+    if not os.path.exists(template_dir):
+        logger.warning(f"Template dir не найден: {template_dir}, пробуем относительный путь")
+        template_dir = 'templates'
+    
     app = Flask(__name__, template_folder=template_dir)
     logger.info(f"Flask app создан. Template dir: {template_dir}")
     logger.info(f"Template dir существует: {os.path.exists(template_dir)}")
+    
+    # Проверяем наличие модулей
+    if Database is None or run_all_parsers is None:
+        logger.warning("Некоторые модули не загружены! Приложение может работать некорректно.")
+        
 except Exception as e:
     logger.error(f"Ошибка при создании Flask app: {e}")
     logger.error(traceback.format_exc())
-    raise
+    # Создаем минимальное приложение для диагностики
+    app = Flask(__name__)
 
 # Простой тестовый endpoint для проверки работоспособности
 @app.route('/test', methods=['GET'])
 def test():
     """Простой тест для проверки работоспособности"""
-    return jsonify({
-        'status': 'ok',
-        'message': 'Serverless function работает!',
-        'root_dir': root_dir,
-        'template_dir': template_dir
-    })
+    try:
+        files_in_root = []
+        if os.path.exists(root_dir):
+            try:
+                files_in_root = [f for f in os.listdir(root_dir) if f.endswith('.py')][:5]
+            except:
+                pass
+        
+        return jsonify({
+            'status': 'ok',
+            'message': 'Serverless function работает!',
+            'root_dir': root_dir,
+            'template_dir': template_dir,
+            'template_exists': os.path.exists(template_dir),
+            'files_in_root': files_in_root,
+            'sys_path': sys.path[:5],
+            'cwd': os.getcwd(),
+            'modules_loaded': {
+                'Database': Database is not None,
+                'run_all_parsers': run_all_parsers is not None
+            }
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
 
 # Инициализация БД с путем для Vercel
 def get_db():
     """Получает экземпляр базы данных"""
+    if Database is None:
+        raise ImportError("Database module not imported. Check logs for details.")
+    
     # На Vercel используем /tmp для записи файлов БД
     # /tmp доступен для записи в serverless функциях
     db_path = os.path.join('/tmp', 'leasing_products.db')
@@ -104,6 +188,15 @@ def get_db():
 def index():
     """Главная страница с результатами парсинга"""
     try:
+        # Проверяем, что модули загружены
+        if Database is None:
+            return jsonify({
+                'error': 'Database module not loaded',
+                'message': 'Проверьте логи сервера. Убедитесь, что database.py находится в корне проекта.',
+                'sys_path': sys.path[:5],
+                'root_dir': root_dir
+            }), 500
+        
         db = get_db()
         products = db.get_all_products(limit=200)
         products_48_months = db.get_products_48_months()
@@ -125,6 +218,20 @@ def index():
             products_48_by_site[site].append(product)
         
         db.close()
+        
+        # Проверяем наличие шаблона
+        template_path = os.path.join(template_dir, 'index.html')
+        if not os.path.exists(template_path):
+            logger.warning(f"Template not found: {template_path}")
+            # Возвращаем JSON вместо HTML если шаблон не найден
+            return jsonify({
+                'error': 'Template not found',
+                'template_path': template_path,
+                'products_by_site': products_by_site,
+                'total_count': len(products),
+                'count_48_months': len(products_48_months)
+            })
+        
         return render_template('index.html', 
                              products_by_site=products_by_site,
                              products_48_by_site=products_48_by_site,
@@ -132,10 +239,15 @@ def index():
                              count_48_months=len(products_48_months))
     except Exception as e:
         logger.error(f"Ошибка в index: {e}", exc_info=True)
-        import traceback
         error_details = traceback.format_exc()
         logger.error(f"Traceback: {error_details}")
-        return jsonify({'error': str(e), 'details': error_details}), 500
+        return jsonify({
+            'error': str(e), 
+            'details': error_details,
+            'root_dir': root_dir,
+            'template_dir': template_dir,
+            'sys_path': sys.path[:5]
+        }), 500
 
 @app.route('/api/products', methods=['GET'])
 def api_products():
@@ -189,6 +301,12 @@ def api_products_48_months():
 def api_refresh():
     """API endpoint для ручного запуска парсинга"""
     try:
+        if run_all_parsers is None:
+            return jsonify({
+                'success': False,
+                'error': 'Parser module not loaded. Check server logs.'
+            }), 500
+        
         db = get_db()
         results = run_all_parsers()
         added = db.add_products(results)
@@ -200,10 +318,11 @@ def api_refresh():
             'message': f'Найдено {len(results)} товаров, добавлено {added} новых'
         })
     except Exception as e:
-        logger.error(f"Ошибка при парсинге: {e}")
+        logger.error(f"Ошибка при парсинге: {e}", exc_info=True)
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': str(e),
+            'traceback': traceback.format_exc()
         }), 500
 
 @app.route('/api/health', methods=['GET'])
@@ -215,8 +334,12 @@ def api_health():
             'root_dir': root_dir,
             'template_dir': template_dir,
             'template_exists': os.path.exists(template_dir),
-            'sys_path': sys.path[:3],  # Первые 3 элемента
-            'cwd': os.getcwd()
+            'sys_path': sys.path[:5],
+            'cwd': os.getcwd(),
+            'modules_loaded': {
+                'Database': Database is not None,
+                'run_all_parsers': run_all_parsers is not None
+            }
         })
     except Exception as e:
         return jsonify({
@@ -235,6 +358,13 @@ def api_cron():
         if cron_secret and auth_header != f'Bearer {cron_secret}':
             return jsonify({'error': 'Unauthorized'}), 401
         
+        if run_all_parsers is None:
+            logger.error("Parser module not loaded in cron job")
+            return jsonify({
+                'success': False,
+                'error': 'Parser module not loaded'
+            }), 500
+        
         db = get_db()
         results = run_all_parsers()
         added = db.add_products(results)
@@ -248,10 +378,11 @@ def api_cron():
             'message': f'Найдено {len(results)} товаров, добавлено {added} новых'
         })
     except Exception as e:
-        logger.error(f"Ошибка в cron job: {e}")
+        logger.error(f"Ошибка в cron job: {e}", exc_info=True)
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': str(e),
+            'traceback': traceback.format_exc()
         }), 500
 
 # Vercel serverless handler
