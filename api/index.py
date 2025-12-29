@@ -3,36 +3,68 @@ Vercel serverless function для парсера лизинга
 """
 import sys
 import os
+import traceback
+
+# Настройка логирования в самом начале
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Определяем корневую директорию проекта
 # На Vercel это будет /var/task, локально - родительская директория api/
-if os.path.exists('/var/task'):
-    # Vercel production
-    root_dir = '/var/task'
+try:
+    if os.path.exists('/var/task'):
+        # Vercel production
+        root_dir = '/var/task'
+    else:
+        # Локальная разработка или другая среда
+        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    
     template_dir = os.path.join(root_dir, 'templates')
-else:
-    # Локальная разработка
-    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    template_dir = os.path.join(root_dir, 'templates')
+    
+    # Добавляем корневую директорию в путь для импорта модулей
+    if root_dir not in sys.path:
+        sys.path.insert(0, root_dir)
+    
+    logger.info(f"Root dir: {root_dir}")
+    logger.info(f"Template dir: {template_dir}")
+    logger.info(f"Template exists: {os.path.exists(template_dir)}")
+    logger.info(f"Current dir: {os.getcwd()}")
+    logger.info(f"Python path: {sys.path[:3]}")
+    
+except Exception as e:
+    logger.error(f"Ошибка при настройке путей: {e}")
+    logger.error(traceback.format_exc())
+    raise
 
-# Добавляем корневую директорию в путь для импорта модулей
-if root_dir not in sys.path:
-    sys.path.insert(0, root_dir)
-
-# Настройка логирования перед импортами
-import logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
+# Импорт модулей с обработкой ошибок
 try:
     from flask import Flask, render_template, jsonify, request
-    from database import Database
-    from parser import run_all_parsers
+    logger.info("Flask импортирован успешно")
 except ImportError as e:
-    logger.error(f"Ошибка импорта модулей: {e}")
+    logger.error(f"Ошибка импорта Flask: {e}")
+    logger.error(traceback.format_exc())
+    raise
+
+try:
+    from database import Database
+    logger.info("Database импортирован успешно")
+except ImportError as e:
+    logger.error(f"Ошибка импорта Database: {e}")
     logger.error(f"sys.path: {sys.path}")
-    logger.error(f"root_dir: {root_dir}")
-    logger.error(f"Текущая директория: {os.getcwd()}")
+    logger.error(traceback.format_exc())
+    raise
+
+try:
+    from parser import run_all_parsers
+    logger.info("Parser импортирован успешно")
+except ImportError as e:
+    logger.error(f"Ошибка импорта Parser: {e}")
+    logger.error(f"sys.path: {sys.path}")
+    logger.error(traceback.format_exc())
     raise
 
 # Настройка Flask приложения
@@ -41,8 +73,20 @@ try:
     logger.info(f"Flask app создан. Template dir: {template_dir}")
     logger.info(f"Template dir существует: {os.path.exists(template_dir)}")
 except Exception as e:
-    logger.error(f"Ошибка при создании Flask app: {e}", exc_info=True)
+    logger.error(f"Ошибка при создании Flask app: {e}")
+    logger.error(traceback.format_exc())
     raise
+
+# Простой тестовый endpoint для проверки работоспособности
+@app.route('/test', methods=['GET'])
+def test():
+    """Простой тест для проверки работоспособности"""
+    return jsonify({
+        'status': 'ok',
+        'message': 'Serverless function работает!',
+        'root_dir': root_dir,
+        'template_dir': template_dir
+    })
 
 # Инициализация БД с путем для Vercel
 def get_db():
